@@ -30,6 +30,8 @@ class User(Base):
     private_key = Column(String, default=lambda: secrets.token_hex(32))
 
     profile = relationship("EmployeeProfile", back_populates="user", uselist=False)
+    environmental_profile = relationship("EnvironmentalProfile", back_populates="user", uselist=False)
+    prediction = relationship("HealthPrediction", back_populates="user", uselist=False)
     reports = relationship("PatientReport", back_populates="user")
     shared_reports = relationship("SharedReport", back_populates="owner")
 
@@ -44,6 +46,23 @@ class EmployeeProfile(Base):
     existing_conditions = Column(String, nullable=True)
 
     user = relationship("User", back_populates="profile")
+
+class EnvironmentalProfile(Base):
+    __tablename__ = "environmental_profiles"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True)
+    
+    latitude = Column(String, nullable=True)
+    longitude = Column(String, nullable=True)
+    
+    avg_temperature = Column(String, nullable=True)
+    avg_humidity = Column(String, nullable=True)
+    avg_wind_speed = Column(String, nullable=True)
+    avg_solar_radiation = Column(String, nullable=True)
+    
+    raw_nasa_data = Column(JSON, nullable=True)
+
+    user = relationship("User", back_populates="environmental_profile")
 
 class PatientReport(Base):
     __tablename__ = "patient_reports"
@@ -83,6 +102,20 @@ class SharedReport(Base):
     is_locked = Column(Boolean, default=False)
 
     owner = relationship("User", back_populates="shared_reports")
+
+class HealthPrediction(Base):
+    __tablename__ = "health_predictions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True)
+    
+    score = Column(Integer, nullable=True) # 0-100, higher = more danger
+    suggestions = Column(JSON, nullable=True)
+    
+    last_calculated = Column(String, nullable=True)
+    previous_context = Column(Text, nullable=True) # Storing stringified previous context text
+    is_calculating = Column(Boolean, default=False)
+    
+    user = relationship("User", back_populates="prediction")
 
 def init_db():
     Base.metadata.create_all(bind=engine)

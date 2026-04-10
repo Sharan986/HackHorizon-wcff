@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, ValidationInfo, field_validator
 from sqlalchemy.orm import Session
@@ -20,9 +20,11 @@ from fastapi.security import OAuth2PasswordBearer
 
 from config import (
     MASTER_PASSWORD, JWT_SECRET, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES,
-    User, EmployeeProfile, PatientReport, SharedReport, init_db, get_db
+    User, EmployeeProfile, EnvironmentalProfile, PatientReport, SharedReport, HealthPrediction, init_db, get_db
 )
 from ocr_utils import extract_text_from_image, format_text_to_json
+from nasa_utils import get_lat_lon, fetch_nasa_power_data
+from prediction_utils import trigger_health_calculation
 from fastapi import UploadFile, File, Form
 
 
@@ -60,6 +62,13 @@ class OnboardingRequest(BaseModel):
     work_location: str
     allergies: str
     existing_conditions: str
+
+class ProfileUpdate(BaseModel):
+    job_role: Optional[str] = None
+    working_since: Optional[str] = None
+    work_location: Optional[str] = None
+    allergies: Optional[str] = None
+    existing_conditions: Optional[str] = None
 
 class ReportUpdate(BaseModel):
     report_type: Optional[str] = None
@@ -124,6 +133,16 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
         raise credentials_exception
     return user
 
+def queue_recalculation(user_id: int, db: Session, background_tasks: BackgroundTasks):
+    prediction = db.query(HealthPrediction).filter(HealthPrediction.user_id == user_id).first()
+    if not prediction:
+        prediction = HealthPrediction(user_id=user_id, is_calculating=True)
+        db.add(prediction)
+    else:
+        prediction.is_calculating = True
+    db.commit()
+    background_tasks.add_task(trigger_health_calculation, user_id)
+
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "API is healthy!"}
@@ -147,7 +166,12 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     return {"message": "User registered successfully"}
 
 @app.post("/onboard")
-def onboard_user(req: OnboardingRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def onboard_user(
+    req: OnboardingRequest, 
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
     if current_user.has_employee_onboarded:
         return {"message": "User already has employee profile"}
     
@@ -161,10 +185,29 @@ def onboard_user(req: OnboardingRequest, current_user: User = Depends(get_curren
     )
     db.add(new_profile)
     
+    # Process environmental profile if a location is provided
+    if req.work_location:
+         lat, lon = get_lat_lon(req.work_location)
+         if lat and lon:
+             nasa_data = fetch_nasa_power_data(lat, lon)
+             if nasa_data:
+                 env_profile = EnvironmentalProfile(
+                     user_id=current_user.id,
+                     latitude=lat,
+                     longitude=lon,
+                     avg_temperature=nasa_data.get('avg_temperature'),
+                     avg_humidity=nasa_data.get('avg_humidity'),
+                     avg_wind_speed=nasa_data.get('avg_wind_speed'),
+                     avg_solar_radiation=nasa_data.get('avg_solar_radiation'),
+                     raw_nasa_data=nasa_data.get('raw_data')
+                 )
+                 db.add(env_profile)
+    
     current_user.has_employee_onboarded = True
     
     db.commit()
-    return {"message": "Onboarding successful, employee profile created"}
+    queue_recalculation(current_user.id, db, background_tasks)
+    return {"message": "Onboarding successful, employee pattern created alongside environmental profile"}
 
 @app.post("/make-employee")
 def make_employee(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -174,6 +217,69 @@ def make_employee(current_user: User = Depends(get_current_user), db: Session = 
     current_user.is_employee = True
     db.commit()
     return {"message": "User status updated to employee"}
+
+@app.patch("/profile")
+def update_profile(
+    req: ProfileUpdate, 
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    profile = current_user.profile
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found. Please onboard first.")
+    
+    update_data = req.model_dump(exclude_unset=True)
+    location_changed = False
+    
+    if "work_location" in update_data and update_data["work_location"] != profile.work_location:
+        location_changed = True
+        
+    for key, value in update_data.items():
+        setattr(profile, key, value)
+        
+    if location_changed:
+        lat, lon = get_lat_lon(profile.work_location)
+        if lat and lon:
+            nasa_data = fetch_nasa_power_data(lat, lon)
+            env_profile = current_user.environmental_profile
+            if not env_profile:
+                env_profile = EnvironmentalProfile(user_id=current_user.id)
+                db.add(env_profile)
+            
+            env_profile.latitude = lat
+            env_profile.longitude = lon
+            if nasa_data:
+                env_profile.avg_temperature = nasa_data.get('avg_temperature')
+                env_profile.avg_humidity = nasa_data.get('avg_humidity')
+                env_profile.avg_wind_speed = nasa_data.get('avg_wind_speed')
+                env_profile.avg_solar_radiation = nasa_data.get('avg_solar_radiation')
+                env_profile.raw_nasa_data = nasa_data.get('raw_data')
+
+    db.commit()
+    queue_recalculation(current_user.id, db, background_tasks)
+    return {"message": "Profile updated successfully, health score recalculating"}
+
+@app.get("/health-score")
+def get_health_score(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    prediction = current_user.prediction
+    if not prediction:
+        return {"status": "not_calculated", "message": "Health score has not been calculated yet."}
+        
+    if prediction.is_calculating:
+        return {
+            "status": "calculating", 
+            "message": "Your health score is currently being analyzed.",
+            "last_score": prediction.score,
+            "last_calculated": prediction.last_calculated
+        }
+        
+    return {
+        "status": "ready",
+        "score": prediction.score,
+        "suggestions": prediction.suggestions,
+        "last_calculated": prediction.last_calculated
+    }
 
 @app.post("/login", response_model=Token)
 def login(req: LoginRequest, db: Session = Depends(get_db)):
@@ -222,6 +328,7 @@ async def create_report(
     prescription_file: Optional[UploadFile] = File(None),
     has_documents: bool = Form(False),
     documents: List[UploadFile] = File(default=[]),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -288,6 +395,8 @@ async def create_report(
     db.commit()
     db.refresh(new_report)
     
+    queue_recalculation(current_user.id, db, background_tasks)
+    
     return {
         "message": "Report created successfully",
         "report_id": new_report.id,
@@ -308,7 +417,13 @@ def get_report(report_id: int, current_user: User = Depends(get_current_user), d
     return report
 
 @app.patch("/reports/{report_id}")
-def update_report(report_id: int, req: ReportUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def update_report(
+    report_id: int, 
+    req: ReportUpdate, 
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
     report = db.query(PatientReport).filter(PatientReport.id == report_id, PatientReport.user_id == current_user.id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -319,10 +434,16 @@ def update_report(report_id: int, req: ReportUpdate, current_user: User = Depend
         
     db.commit()
     db.refresh(report)
+    queue_recalculation(current_user.id, db, background_tasks)
     return {"message": "Report updated successfully", "report_id": report.id}
 
 @app.delete("/reports/{report_id}")
-def delete_report(report_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def delete_report(
+    report_id: int, 
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
     report = db.query(PatientReport).filter(PatientReport.id == report_id, PatientReport.user_id == current_user.id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -338,6 +459,7 @@ def delete_report(report_id: int, current_user: User = Depends(get_current_user)
 
     db.delete(report)
     db.commit()
+    queue_recalculation(current_user.id, db, background_tasks)
     return {"message": "Report deleted successfully"}
 
 
@@ -447,3 +569,55 @@ def get_shared_report(share_id: str, pin: str, db: Session = Depends(get_db)):
         "key_part_a": shared.key_part_a,
         "share_id": share_id
     }
+
+
+def print_user_data(user_id: int, db: Session):
+    """
+    Utility function that aggregates and prints all user data and reports 
+    (excluding raw document files) for diagnostic/testing purposes.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        print(f"User {user_id} not found.")
+        return
+        
+    print(f"--- Data for User: {user.name} ({user.username}) ---")
+    print(f"Email: {user.email}")
+    print(f"Is Employee: {user.is_employee}")
+    print(f"Has Onboarded: {user.has_employee_onboarded}")
+    
+    if user.profile:
+        print("\n[Employee Profile]")
+        print(f"  Job Role: {user.profile.job_role}")
+        print(f"  Working Since: {user.profile.working_since}")
+        print(f"  Work Location: {user.profile.work_location}")
+        print(f"  Allergies: {user.profile.allergies}")
+        print(f"  Existing Conditions: {user.profile.existing_conditions}")
+    else:
+        print("\n[Employee Profile] Not Set")
+        
+    if user.environmental_profile:
+        print("\n[Environmental Working Condition Profile (from NASA POWER)]")
+        print(f"  Coordinates: {user.environmental_profile.latitude}, {user.environmental_profile.longitude}")
+        print(f"  Avg Annual Temperature: {user.environmental_profile.avg_temperature} °C")
+        print(f"  Avg Annual Humidity: {user.environmental_profile.avg_humidity}%")
+        print(f"  Avg Annual Wind Speed: {user.environmental_profile.avg_wind_speed} m/s")
+        print(f"  Avg Annual Solar Radiation: {user.environmental_profile.avg_solar_radiation} kW-hr/m^2/day")
+    else:
+        print("\n[Environmental Profile] Not Set or API fetch failed")
+    
+    if user.reports:
+        print(f"\n[Patient Reports ({len(user.reports)})]")
+        for r in user.reports:
+            print(f"- Report ID: {r.id} | Type: {r.report_type} | Name: {r.report_name} | Date: {r.report_date}")
+            if r.report_description: print(f"  Description: {r.report_description}")
+            if r.report_conclusion: print(f"  Conclusion: {r.report_conclusion}")
+            print(f"  Doctor: {r.doctor_name} | Hospital: {r.hospital_or_clinic}")
+            if r.tags: print(f"  Tags: {r.tags}")
+            if r.prescription_data:
+                print(f"  Extracted Prescription JSON: {json.dumps(r.prescription_data)}")
+            print("  ---")
+    else:
+        print("\n[Patient Reports] None")
+        
+    print("--------------------------------------------------")
